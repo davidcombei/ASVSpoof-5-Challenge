@@ -1,26 +1,23 @@
-import sys, os
+
 import numpy as np
-import random
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchmetrics import Precision, Recall, ConfusionMatrix, Accuracy
 
-from copy import deepcopy
+
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import confusion_matrix, classification_report, roc_curve
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
 from tqdm import tqdm
 
-
 from dataset import ASVSpoof5, FeatCollate2D
-from models import Conv1DModel, Transformer, GRUModel
+from models import Conv1DModel, Transformer
 
 import warnings
 warnings.filterwarnings("ignore")
-
 
 def compute_ece(y_true, y_pred, num_bins=15):
     """Expected calibration error for binary classifier."""
@@ -51,8 +48,7 @@ def compute_min_dcf(fpr, fnr, thresholds, p_target=0.01, c_miss=1, c_fa=1):
     min_dcf_threshold = thresholds[np.argmin(dcf)]
     return min_dcf, min_dcf_threshold
 
-##################
-## EVAL
+
 def eval(loader, model, device, loss_fn, subset):
     precision = Precision(task="binary", average='weighted').to(device)
     recall = Recall(task="binary", average='weighted').to(device)
@@ -108,101 +104,35 @@ def eval(loader, model, device, loss_fn, subset):
     return eer, eer_thresh, min_dcf, min_dcf_thresh
 
 
-############
-## TRAIN
-def train(model, train_loader, val_loader, optimizer, lossfn, num_epochs=25, device='cuda', out_model=''):
-    precision = Precision(task="binary").to(device)
-    recall = Recall(task="binary", average='weighted').to(device)
-    accuracy = Accuracy(task="multilabel", num_labels=50).to(device)
-
-    MAX_EER = 1000
-    print("\n*** Starting the training process...")
-    for epoch in range(num_epochs):
-        model.train()
-        tloss = 0
-        num_steps = 1
-        loop = tqdm(train_loader)
-        for batch in loop:
-            X, y, input_lengths, files = batch
-
-            X = X.to(device)
-            y = y.to(device)
-            optimizer.zero_grad()
-            y_hat = model(X)
-
-            loss = lossfn(y_hat, y)
-            tloss += loss.item() / num_steps
-            num_steps += 1
-
-            loss.backward()
-            optimizer.step()
-            loop.set_description(f"Epoch [{epoch + 1}/{num_epochs}]")
-            loop.set_postfix(loss=tloss,
-                             precision=precision(y_hat, y).item())  # , accuracy=accuracy(y_hat_sig, y).item())
-
-        # VALIDATION
-        eer, eer_thresh, min_dcf, min_dcf_thresh = eval(val_loader, model, device, lossfn, 'VAL')
-        if eer <= MAX_EER:# and thresh.item() > 0 and thresh.item() < 1.0:
-            best_model = deepcopy(model)
-            MAX_EER = eer
-            torch.save(best_model.state_dict(), out_model)
-            print(f"Saved model to {out_model} at {np.round(eer*100,2)}")
-
-    return best_model
-
-
 def main():
     ### ASVSpoof
-    trainfile_asv = "/home/asvspoof/DATA/asvspoof24/metadata/ASVspoof5.train.metadata.txt"
     valfile_asv = "/home/asvspoof/DATA/asvspoof24/metadata/ASVspoof5.dev.metadata.txt"
-    traindir_asv_wav = "/home/asvspoof/DATA/asvspoof24/flac_T/"
     valdir_asv_wav = "/home/asvspoof/DATA/asvspoof24/flac_D/"
+
+
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("RUNNING on:", device)
-    
-    OUT_MODEL = 'saved_models/asv_melspec_BiGRU.pt'
-    seed = 46
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    random.seed(seed)
 
-    ## Setup data and model
-    print("*** Loading training data...")
-    traindataset = ASVSpoof5(trainfile_asv, traindir_asv_wav, max_samples=-1)
+    OUT_MODEL = 'saved_models/asv_melspec_Transformer.pt'
+
 
     print("\n*** Loading validation data...")
     valdataset = ASVSpoof5(valfile_asv, valdir_asv_wav, max_samples=-1)
 
-   # model = Conv1DModel(input_channels=128, kernel_size=10)
-   # model =Transformer(src_vocab_size=2, d_model=500, num_heads=5,num_layers=6, d_ff=2048, max_seq_length=128, dropout=0.1)
-    model = GRUModel(input_dim=500, hidden_dim=128, output_dim=2, dropout=0.2, layers=2,bidirectional_flag=True)
-    optimizer = torch.optim.Adam(model.parameters(), betas=(0.93, 0.98), lr=3e-4)
+    model = Transformer(src_vocab_size=2, d_model=500, num_heads=5, num_layers=6, d_ff=2048, max_seq_length=128,
+                        dropout=0.1)
+    model.load_state_dict(torch.load(OUT_MODEL))
+    model.to(device)
+
     loss_ce = nn.BCEWithLogitsLoss()
-
     collate_fn = FeatCollate2D()
-    BATCH_SIZE = 256
-    trainloader = DataLoader(traindataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, num_workers=0)
-    valloader = DataLoader(valdataset, batch_size=BATCH_SIZE, shuffle=False , collate_fn = collate_fn, num_workers=0)
-    
-    if not os.path.exists('saved_models'):
-        os.makedirs('saved_models/')
+    BATCH_SIZE = 128
+    valloader = DataLoader(valdataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn, num_workers=0)
 
-    ## Run the train loop
-    best_model = train(model=model.to(device),
-                       train_loader=trainloader,
-                       val_loader=valloader,
-                       optimizer=optimizer,
-                       lossfn=loss_ce,
-                       device=device,
-                       out_model = OUT_MODEL)
-    
-    
-    ## Save final model
-    torch.save(best_model.state_dict(), OUT_MODEL[:-3]+'_final.pt')
-    print("Saved final model to ... ", OUT_MODEL[:-3]+'_final.pt')
 
-    
+    eval(valloader, model, device, loss_ce, 'VAL')
+
 
 if __name__ == '__main__':
     main()

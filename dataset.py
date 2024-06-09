@@ -1,3 +1,4 @@
+import librosa
 import os
 from torch.utils.data import Dataset
 import torchaudio
@@ -24,8 +25,10 @@ class ASVSpoof5(Dataset):
     print("ASV Number of samples:", self.num_samples)
 
   def process_asv_metadata(self):
+    #available_files = [x[:-5] for x in os.listdir(self.datadir)]
+    
     with open(self.metafile) as fin:
-        asv_labels = [[x.strip().split()[1], np.array([1., 0.]) if x.strip().split()[-1]=='bonafide' else np.array([0., 1.])] for x in fin.readlines()]
+        asv_labels = [[x.strip().split()[1], np.array([0., 1.]) if x.strip().split()[-1]=='bonafide' else np.array([1., 0.])] for x in fin.readlines()]# if x.strip().split()[1] in available_files]
     return asv_labels
 
   def __len__(self):
@@ -37,7 +40,7 @@ class ASVSpoof5(Dataset):
     transform = torchaudio.transforms.MelSpectrogram(sr, normalized=True) 
     mel_specgram = torch.log(transform(wav)+ 1e-7) # Adding a small value to avoid log(0)
     # Normalize the log mel spectrogram (optional)
-    mel_specgram = (mel_specgram - mel_specgram.min()) / (mel_specgram.max() - mel_specgram.min())
+    #mel_specgram = (mel_specgram - mel_specgram.min()) / (mel_specgram.max() - mel_specgram.min())
     feat = mel_specgram.squeeze()
 
     Ys = self.training_data[idx][1]
