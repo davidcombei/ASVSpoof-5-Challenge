@@ -243,3 +243,49 @@ class GRUModel(nn.Module):
         output = self.dropout(output)
         out = self.fc2(output)
         return out
+
+
+##########################
+##### Define CNN SELF ATTN
+
+input_size = 768
+class SelfAttentionPooling(nn.Module):
+  def __init__(self, input_size):
+    super(SelfAttentionPooling, self).__init__()
+    self.W = nn.Linear(input_size, 1)
+  def forward(self, batch):
+    attention_weight = nn.functional.softmax(self.W(batch).squeeze(-1)).unsqueeze(-1)
+    utter_rep = torch.sum(batch * attention_weight, dim=1)
+
+
+
+
+    return utter_rep
+
+class CNNSelfAttn(nn.Module):
+  def __init__(self, embedding_dim, filter_sizes, output_dim):
+    super(CNNSelfAttn, self).__init__()
+    self.embedding_dim = embedding_dim
+    self.conv1 = nn.Conv1d(in_channels=embedding_dim, out_channels=embedding_dim // 2, kernel_size=filter_sizes[0], padding='same')
+    self.conv2 = nn.Conv1d(in_channels=embedding_dim // 2, out_channels=embedding_dim // 4, kernel_size=filter_sizes[1], padding='same')
+    self.sa = SelfAttentionPooling(embedding_dim // 4)
+    self.fc = nn.Linear(embedding_dim//4, output_dim)
+    self.relu = nn.ReLU()
+    self.sigmoid = nn.Sigmoid()
+
+
+  def forward(self, x):
+    x = x.permute(0, 2, 1)
+    x = self.relu(self.conv1(x))
+  #  print('shape after first conv:', x.shape)
+    x = self.relu(self.conv2(x))
+ #   print('shape after sencond conv:', x.shape)
+    x = x.permute(0, 2, 1)
+    x = self.sa(x)
+#    print('shape after self attn:', x.shape)
+    x = self.fc(x)
+
+
+
+    return x
+
