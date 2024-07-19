@@ -4,7 +4,7 @@ import random
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 from torchmetrics import Precision, Recall, ConfusionMatrix, Accuracy
 
 from copy import deepcopy
@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 
 from dataset import ASVSpoof5, FeatCollate2D
-from models import Conv1DModel, Transformer, GRUModel
+from models import Conv1DModel, Transformer, GRUModel,CNNSelfAttn
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -67,7 +67,8 @@ def eval(loader, model, device, loss_fn, subset):
         num_iters = 0
 
         for batch in tqdm(loader):
-            X, y, _, _ = batch
+           # X, y, _, _ = batch
+            X,y = batch
             X = torch.as_tensor(X, dtype=torch.float, device=device)
             y = torch.as_tensor(y, dtype=torch.float, device=device)
             y_class = torch.argmax(y, dim=1)
@@ -123,10 +124,11 @@ def train(model, train_loader, val_loader, optimizer, lossfn, num_epochs=25, dev
         num_steps = 1
         loop = tqdm(train_loader)
         for batch in loop:
-            X, y, input_lengths, files = batch
-
+            # X, y,_,_ = batch
+            X,y = batch
             X = X.to(device)
             y = y.to(device)
+#            print(X.shape)
             optimizer.zero_grad()
             y_hat = model(X)
 
@@ -147,7 +149,7 @@ def train(model, train_loader, val_loader, optimizer, lossfn, num_epochs=25, dev
             MAX_EER = eer
             torch.save(best_model.state_dict(), out_model)
             print(f"Saved model to {out_model} at {np.round(eer*100,2)}")
-
+    print('BEST EER:', MAX_EER)    
     return best_model
 
 
@@ -158,10 +160,18 @@ def main():
     traindir_asv_wav = "/home/asvspoof/DATA/asvspoof24/flac_T/"
     valdir_asv_wav = "/home/asvspoof/DATA/asvspoof24/flac_D/"
 
+    train_file = torch.load("/home/asvspoof/DATA/asvspoof24/wavLM-base/train_200x768_wavLMV3.pth")
+    train_feats = train_file['feats']
+    train_labels = train_file['label']
+
+    dev_file = torch.load("/home/asvspoof/DATA/asvspoof24/wavLM-base/dev_200x768_wavLMV3.pth")
+    dev_feats = dev_file['feats']
+    dev_labels = dev_file['label']
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("RUNNING on:", device)
     
-    OUT_MODEL = 'saved_models/asv_melspec_BiGRU.pt'
+    OUT_MODEL = 'saved_models/CNNSelfAttn.pt'
     seed = 46
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -169,21 +179,27 @@ def main():
 
     ## Setup data and model
     print("*** Loading training data...")
-    traindataset = ASVSpoof5(trainfile_asv, traindir_asv_wav, max_samples=-1)
+    #traindataset = ASVSpoof5(trainfile_asv, traindir_asv_wav, max_samples=-1)
 
+    train_DS = TensorDataset(torch.Tensor(train_feats),torch.Tensor(train_labels))                      
+    trainloader = DataLoader(train_DS, batch_size =256,shuffle=True)
+
+    dev_DS = TensorDataset(torch.Tensor(dev_feats), torch.Tensor(dev_labels))
+    valloader = DataLoader(dev_DS, batch_size=256, shuffle=False)
     print("\n*** Loading validation data...")
-    valdataset = ASVSpoof5(valfile_asv, valdir_asv_wav, max_samples=-1)
+    #valdataset = ASVSpoof5(valfile_asv, valdir_asv_wav, max_samples=-1)
 
    # model = Conv1DModel(input_channels=128, kernel_size=10)
    # model =Transformer(src_vocab_size=2, d_model=500, num_heads=5,num_layers=6, d_ff=2048, max_seq_length=128, dropout=0.1)
-    model = GRUModel(input_dim=500, hidden_dim=128, output_dim=2, dropout=0.2, layers=2,bidirectional_flag=True)
+    #model = GRUModel(input_dim=500, hidden_dim=128, output_dim=2, dropout=0.2, layers=2,bidirectional_flag=True)
+    model = CNNSelfAttn(embedding_dim=768,filter_sizes= [2,3],output_dim=2)
     optimizer = torch.optim.Adam(model.parameters(), betas=(0.93, 0.98), lr=3e-4)
     loss_ce = nn.BCEWithLogitsLoss()
 
     collate_fn = FeatCollate2D()
     BATCH_SIZE = 256
-    trainloader = DataLoader(traindataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, num_workers=0)
-    valloader = DataLoader(valdataset, batch_size=BATCH_SIZE, shuffle=False , collate_fn = collate_fn, num_workers=0)
+    #trainloader = DataLoader(traindataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, num_workers=0)
+    #valloader = DataLoader(valdataset, batch_size=BATCH_SIZE, shuffle=False , collate_fn = collate_fn, num_workers=0)
     
     if not os.path.exists('saved_models'):
         os.makedirs('saved_models/')
