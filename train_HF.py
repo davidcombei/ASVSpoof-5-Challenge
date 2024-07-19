@@ -1,25 +1,22 @@
 import sys, os
-import numpy as np
 import random
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchmetrics import Precision, Recall, ConfusionMatrix, Accuracy
+from torchvision.transforms import transforms
 
-import torchvision.models as models
-from transformers import AutoModelForImageClassification, AutoFeatureExtractor
-
-from copy import deepcopy
-from sklearn.calibration import calibration_curve
-from sklearn.metrics import confusion_matrix, classification_report, roc_curve
+from sklearn.metrics import roc_curve
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
 from tqdm import tqdm
 
+from datasets import load_dataset
+from transformers import AutoImageProcessor, ResNetForImageClassification, TrainingArguments, Trainer, AutoModelForImageClassification
 
-from im_dataset import ASVSpoof5_im
-from models import ResNet, BasicBlock, ResNetNew, block, BiLSTM, ResNet50, ResNet50BiLSTM
+from im_dataset import ASVSpoof5_im  # Assuming you have defined this dataset class
+from models import ResNet, BasicBlock, ResNetNew, block, BiLSTM, ResNet50, ResNet50BiLSTM  # Assuming these are custom models you might use
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -33,7 +30,6 @@ def compute_ece(y_true, y_pred, num_bins=15):
     counts = counts[nonzero]
     p_true, p_pred = calibration_curve(y_true, y_pred, n_bins=num_bins)
     return np.sum(np.abs(p_true - p_pred) * counts) / counts.sum()
-
 
 def mask_from_lens(lens, max_len=None):
     if max_len is None:
@@ -53,8 +49,6 @@ def compute_min_dcf(fpr, fnr, thresholds, p_target=0.01, c_miss=1, c_fa=1):
     min_dcf_threshold = thresholds[np.argmin(dcf)]
     return min_dcf, min_dcf_threshold
 
-##################
-## EVAL
 def eval(loader, model, device, loss_fn, subset):
     precision = Precision(task="binary", average='weighted').to(device)
     recall = Recall(task="binary", average='weighted').to(device)
@@ -66,22 +60,20 @@ def eval(loader, model, device, loss_fn, subset):
         Y = torch.tensor([], device=device)
         Y_hat = torch.tensor([], device=device)
         Y_hat_score = torch.tensor([], device=device)
-        num_iters = 0
 
         for batch in tqdm(loader):
             X, y, _ = batch
-            X = torch.as_tensor(X, dtype=torch.float, device=device)
-            y = torch.as_tensor(y, dtype=torch.float, device=device)
+            X = X.to(device)
+            y = y.to(device)
             y_class = torch.argmax(y, dim=1)
             Y = torch.cat((Y, y_class))
 
-            y_hat = model(X)
-
-            y_hat = nn.Softmax(dim=1)(y_hat)
-            Y_hat_score = torch.cat((Y_hat_score, y_hat[:, 1]))
-            y_hat_class = torch.argmax(y_hat, dim=1)
+            outputs = model(X)
+            probabilities = nn.Softmax(dim=1)(outputs)
+            y_hat_score = probabilities[:, 1]
+            y_hat_class = torch.argmax(probabilities, dim=1)
             Y_hat = torch.cat((Y_hat, y_hat_class))
-            num_iters += 1
+            Y_hat_score = torch.cat((Y_hat_score, y_hat_score))
 
     fpr, tpr, thresholds = roc_curve(Y.cpu().detach().numpy(),
                                      Y_hat_score.cpu().detach().numpy(), pos_label=1)
@@ -109,10 +101,7 @@ def eval(loader, model, device, loss_fn, subset):
     print(subset + " ECE: ", np.round(ece * 100, 2))
     return eer, eer_thresh, min_dcf, min_dcf_thresh
 
-
-############
-## TRAIN
-def train(model, train_loader, val_loader, optimizer, lossfn, num_epochs=50, device='cuda', out_model=''):
+def train(model, train_loader, val_loader, optimizer, loss_fn, num_epochs=50, device='cuda', out_model=''):
     precision = Precision(task="binary").to(device)
     recall = Recall(task="binary", average='weighted').to(device)
     accuracy = Accuracy(task="multilabel", num_labels=50).to(device)
@@ -129,8 +118,8 @@ def train(model, train_loader, val_loader, optimizer, lossfn, num_epochs=50, dev
             X = X.to(device)
             y = y.to(device)
             optimizer.zero_grad()
-            y_hat = model(X)
-            loss = lossfn(y_hat, y)
+            outputs = model(X)
+            loss = loss_fn(outputs, y)
             tloss += loss.item() / num_steps
             num_steps += 1
 
@@ -138,11 +127,11 @@ def train(model, train_loader, val_loader, optimizer, lossfn, num_epochs=50, dev
             optimizer.step()
             loop.set_description(f"Epoch [{epoch + 1}/{num_epochs}]")
             loop.set_postfix(loss=tloss,
-                             precision=precision(y_hat, y).item())  # , accuracy=accuracy(y_hat_sig, y).item())
+                             precision=precision(outputs, y).item())
 
         # VALIDATION
-        eer, eer_thresh, min_dcf, min_dcf_thresh = eval(val_loader, model, device, lossfn, 'VAL')
-        if eer <= MAX_EER:# and thresh.item() > 0 and thresh.item() < 1.0:
+        eer, eer_thresh, min_dcf, min_dcf_thresh = eval(val_loader, model, device, loss_fn, 'VAL')
+        if eer <= MAX_EER:
             best_model = deepcopy(model)
             MAX_EER = eer
             torch.save(best_model.state_dict(), out_model)
@@ -150,68 +139,50 @@ def train(model, train_loader, val_loader, optimizer, lossfn, num_epochs=50, dev
 
     return best_model
 
-
 def main():
-    ### ASVSpoof
-    trainfile_asv = "/home/asvspoof/DATA/asvspoof24/metadata/ASVspoof5.train.metadata.txt"
+    trainfile_asv = "/home/asvspoof/DATA/asvspoof24/metadata/ASVspoof5.train_MEDIUM.metadata.txt"
     valfile_asv = "/home/asvspoof/DATA/asvspoof24/metadata/ASVspoof5.dev_MEDIUM.metadata.txt"
-    traindir_asv_wav = "/home/asvspoof/DATA/asvspoof24/mel_im_T_ALL"
+    traindir_asv_wav = "/home/asvspoof/DATA/asvspoof24/Im_TT"
     valdir_asv_wav = "/home/asvspoof/DATA/asvspoof24/Im_D"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("RUNNING on:", device)
     
-    OUT_MODEL = '/home/asvspoof/work/ASVSpoof2024/CNN/saved_models/asv_im_ResNet50_finetune_fullSet.pt'
+    OUT_MODEL = '/home/asvspoof/work/ASVSpoof2024/CNN/saved_models/asv_im_ResNet18_finetune_HF_subset.pt'
     seed = 46
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     random.seed(seed)
 
-    ## Setup data and model
     print("*** Loading training data...")
     traindataset = ASVSpoof5_im(trainfile_asv, traindir_asv_wav, max_samples=-1)
 
     print("\n*** Loading validation data...")
     valdataset = ASVSpoof5_im(valfile_asv, valdir_asv_wav, max_samples=-1)
 
-   # model = Conv1DModel(input_channels=128, kernel_size=10)
-   # model =Transformer(src_vocab_size=2, d_model=500, num_heads=5,num_layers=6, d_ff=2048, max_seq_length=128, dropout=0.1)
-   # model = GRUModel(input_dim=500, hidden_dim=128, output_dim=2, dropout=0.2, layers=2,bidirectional_flag=True)
-   # model = ResNet32Binary(num_classes=2)
-   # model = ResNet50()
-   # model = ResNet50BiLSTM(128,5,2)
-    model = models.resnet50(pretrained=True)
-    num_classes = 2
-    model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
-   # model_name = "Francesco/resnet18"
-   # feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
-   # model = AutoModelForImageClassification.from_pretrained(model_name, num_labels=2, ignore_mismatched_sizes=True)
+    model = AutoModelForImageClassification.from_pretrained("microsoft/resnet-18", num_labels=2, ignore_mismatched_sizes=True)
+
     optimizer = torch.optim.Adam(model.parameters(), betas=(0.93, 0.98), lr=3e-4)
-    loss_ce = nn.BCEWithLogitsLoss()
+    loss_ce = nn.CrossEntropyLoss()
 
-    BATCH_SIZE = 32
-
+    BATCH_SIZE = 64
 
     trainloader = DataLoader(traindataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     valloader = DataLoader(valdataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-    
+
     if not os.path.exists('saved_models'):
         os.makedirs('saved_models/')
 
-    ## Run the train loop
     best_model = train(model=model.to(device),
-                       train_loader=trainloader,
-                       val_loader=valloader,
-                       optimizer=optimizer,
-                       lossfn=loss_ce,
-                       device=device,
-                       out_model = OUT_MODEL)
-    
-    
-    ## Save final model
+            train_loader=trainloader,
+            val_loader=valloader,
+            optimizer=optimizer,
+            loss_fn=loss_ce,
+            num_epochs=50,
+            device=device,
+            out_model=OUT_MODEL)
     torch.save(best_model.state_dict(), OUT_MODEL[:-3]+'_final.pt')
-    print("Saved final model to ... ", OUT_MODEL[:-3]+'_final.pt')
-
+    print("Saved final model to ...", OUT_MODEL[:-3]+'_final.pt')
     print("\n*** Evaluating the final model on validation data...")
     best_model.load_state_dict(torch.load(OUT_MODEL))
     eval(valloader, best_model.to(device), device, loss_ce, 'FINAL VAL')
