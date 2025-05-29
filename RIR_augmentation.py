@@ -10,6 +10,7 @@ rir_raw, sample_rate = torchaudio.load(SAMPLE_RIR)
 rir = rir_raw[:, int(sample_rate * 1.01) : int(sample_rate * 1.3)]
 rir = rir / torch.linalg.vector_norm(rir, ord=2)
 
+
 def read_metadata(file_path):
     relevant_files = []
     with open(file_path, 'r') as f:
